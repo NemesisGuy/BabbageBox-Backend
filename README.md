@@ -109,3 +109,9 @@ pytest
 
 Data is stored in the `data/` directory:
 - `babbage.db`: SQLite database for conversations and memories
+
+
+
+
+
+cd "C:\Users\<user>\Documents\Python Projects\BabbageBox"; & ".\.venv\Scripts\Activate.ps1"; cd Babbagebox-Backend; python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload

@@ -66,7 +66,7 @@ class TranscribeResponse(BaseModel):
 class ProcessRequest(BaseModel):
     text: str
     conversation_id: Optional[int] = None
-    context: Optional[List[str]] = None
+    context: Optional[List[dict]] = None
     persona_mode: Optional[str] = None
     custom_system_prompt: Optional[str] = None
     include_search: bool = False
@@ -145,10 +145,19 @@ class ContextCorrectionResponse(BaseModel):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    _init_db()
-    _init_llama()
-    _init_whisper()
-    yield
+    print("Starting lifespan")
+    try:
+        _init_db()
+        print("DB init done")
+        _init_llama()
+        print("Llama init done")
+        # _init_whisper()
+        print("Yielding")
+        yield
+        print("Lifespan end")
+    except Exception as e:
+        print(f"Exception in lifespan: {e}")
+        raise
 
 
 
@@ -179,7 +188,7 @@ app.add_middleware(
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 DB_PATH = DATA_DIR / "babbage.db"
 EMBED_DIM = 384
-LLAMA_MODEL_PATH = os.environ.get("LLAMA_MODEL_PATH")
+LLAMA_MODEL_PATH = r"C:/Users/Reign/Documents/Python Projects/BabbageBox/models/qwen2.5-1.5b-instruct-q4_k_m.gguf"
 WHISPER_MODEL_SIZE = os.environ.get("WHISPER_MODEL_SIZE", "tiny")
 
 # ------------------------------------------------------------
@@ -324,35 +333,26 @@ def _init_db() -> None:
 def _init_llama() -> None:
     global _llama, LLAMA_MODEL_PATH
     model_path = LLAMA_MODEL_PATH
-    if not model_path:
-        # Auto-select the first available GGUF model
-        models_dir = Path(r"C:/Users/Reign/Documents/Python Projects/BabbageBox/models")
-        if models_dir.exists():
-            gguf_files = sorted(models_dir.glob("*.gguf"), key=lambda p: p.stat().st_size)
-            if gguf_files:
-                model_path = str(gguf_files[0])
-                logging.info("Auto-selected smallest model: %s", model_path)
-            else:
-                logging.warning("No GGUF models found in %s", models_dir)
-        else:
-            logging.warning("Models directory not found: %s", models_dir)
-    else:
-        # If only a filename is provided, prepend models directory
-        if not os.path.isabs(model_path):
-            models_dir = Path(r"C:/Users/Reign/Documents/Python Projects/BabbageBox/models")
-            model_path = str(models_dir / model_path)
+    logging.info("Using model: %s", model_path)
     
     if model_path and Llama is not None:
         try:
+            # Determine chat format based on model name
+            chat_format = None
+            model_name_lower = os.path.basename(model_path).lower()
+            if 'gemma' in model_name_lower:
+                chat_format = "gemma"  # Explicitly set the chat format for Gemma models
+            elif 'tinyllama' in model_name_lower or 'llama' in model_name_lower:
+                chat_format = None  # Manual for TinyLlama/Llama variants
+            
             _llama = Llama(
                 model_path=model_path,
                 n_ctx=LLAMA_CTX_SIZE,
                 n_threads=LLAMA_N_THREADS,
-                embedding=True,
-                chat_format=None,  # Disable automatic chat formatting to use manual prompts
+                chat_format=chat_format,  # Set appropriate chat format
             )
             LLAMA_MODEL_PATH = model_path  # Update the global
-            logging.info("LLaMA initialized from %s", model_path)
+            logging.info("LLaMA initialized from %s with chat_format=%s", model_path, chat_format)
         except Exception as exc:  # pragma: no cover - runtime guard
             logging.warning("LLaMA init failed, using stubs. Error: %s", exc)
             _llama = None
@@ -520,151 +520,75 @@ def transcribe(payload: TranscribeRequest) -> TranscribeResponse:
 
 
 def _build_prompt(model_name: str, system_prompt: str, ctx: list, user_text: str) -> Tuple[str, List[str]]:
-    """Builds a model-specific prompt and returns the prompt and stop words."""
-    
-    conversation_history = ""
-    if 'mistral' in model_name:
-        conversation_parts = []
-        for msg in ctx:
-            if msg['role'] == 'user':
-                conversation_parts.append(f"[INST] {msg['content']} [/INST]")
-            elif msg['role'] == 'assistant':
-                conversation_parts.append(f"{msg['content']}</s>")
-        conversation_parts.append(f"[INST] {user_text} [/INST]")
-        prompt = f"<s>{''.join(conversation_parts)}"
-        stop = ["</s>"]
-        return prompt, stop
-
-    # For other models, build a simple string history
-    for msg in ctx:
-        conversation_history += f"<|{msg['role']}|>\n{msg['content']}<|endoftext|>\n"
-
-    if 'qwen' in model_name:
-        prompt = (
-            f"<|im_start|>system\n{system_prompt}\n"
-            f"{conversation_history}"
-            f"<|im_start|>user\n{user_text}<|im_end|>\n"
-            "<|im_start|>assistant\n"
-        )
-        stop = ["<|im_end|>", "<|im_start|>"]
-    elif 'phi' in model_name:
-        prompt = (
-            f"System: {system_prompt}\n"
-            f"{conversation_history}"
-            f"User: {user_text}\n"
-            "Assistant:"
-        )
-        stop = ["User:", "System:", "Assistant:"]
-    elif 'gemma' in model_name:
-        prompt = (
-            f"<start_of_turn>user\n{system_prompt}\n\n"
-            f"{conversation_history}{user_text}<end_of_turn>\n"
-            "<start_of_turn>model\n"
-        )
-        stop = ["<end_of_turn>"]
+    """
+    Build a model-specific prompt and return the prompt and stop words.
+    Supports TinyLlama, Gemma, and Qwen models.
+    """
+    if 'tinyllama' in model_name.lower():
+        from prompts.tinyllama_prompt import build_tinyllama_prompt
+        from models.tinyllama import TINYLLAMA_SYSTEM_PROMPT
+        system_prompt = TINYLLAMA_SYSTEM_PROMPT
+        prompt, stop = build_tinyllama_prompt(system_prompt, ctx, user_text)
+    elif 'gemma' in model_name.lower():
+        from prompts.gemma_prompt import build_gemma_prompt
+        from models.gemma import GEMMA_SYSTEM_PROMPT
+        system_prompt = GEMMA_SYSTEM_PROMPT
+        prompt, stop = build_gemma_prompt(system_prompt, ctx, user_text)
+    elif 'qwen' in model_name.lower():
+        from prompts.qwen_prompt import build_qwen_prompt
+        from models.qwen import QWEN_SYSTEM_PROMPT
+        system_prompt = QWEN_SYSTEM_PROMPT
+        prompt, stop = build_qwen_prompt(system_prompt, ctx, user_text)
     else:
-        # Default for TinyLlama
-        prompt = (
-            f"<|system|>\n{system_prompt}<|endoftext|>\n"
-            f"{conversation_history}"
-            f"<|user|>\n{user_text}<|endoftext|>\n"
-            "<|assistant|>\n"
-        )
-        stop = ["<|user|>", "<|assistant|>", "<|system|>", "<|endoftext|>"]
-        
+        # Fallback to TinyLlama for unknown models
+        from prompts.tinyllama_prompt import build_tinyllama_prompt
+        from models.tinyllama import TINYLLAMA_SYSTEM_PROMPT
+        system_prompt = TINYLLAMA_SYSTEM_PROMPT
+        prompt, stop = build_tinyllama_prompt(system_prompt, ctx, user_text)
     return prompt, stop
 
 @app.post("/api/process", response_model=ProcessResponse)
 def process_text(payload: ProcessRequest) -> ProcessResponse:
+    global _llama
+    # Debug: log the received context for troubleshooting memory issues
+    logging.info("[DEBUG] Received context (len=%d): %s", len(payload.context or []), json.dumps(payload.context or [], ensure_ascii=False, indent=2))
+
+    # Conversation state: always append, never overwrite
+    # Use chat.history_manager for append logic
+    from chat.history_manager import append_message
     ctx = payload.context or []
-    sources: List[str] = []
+    sources: list = []
+    
+    # The 'ctx' from the payload is used to build a limited history for context.
+    # History is NOT loaded from the database to prevent prompt corruption.
     if payload.conversation_id:
-        # Get recent conversation history instead of searching
-        with _connect() as conn:
-            cur = conn.execute(
-                "SELECT role, content FROM memories WHERE conversation_id = ? ORDER BY id DESC LIMIT 20",
-                (payload.conversation_id,),
-            )
-            recent_memories = cur.fetchall()
-        # Reverse to get chronological order
-        ctx.extend([{"role": row[0], "content": row[1]} for row in reversed(recent_memories)])
-        sources.append("memory:recent")
-    if payload.include_search:
-        try:
-            search_payload = McpSearchRequest(query=payload.text, top_k=3)
-            search_res = mcp_search(search_payload)
-            filtered_results = [
-                item for item in (search_res.results or [])
-                if not item.lower().startswith("no direct answer found")
-                and not item.lower().startswith("stub result")
-            ]
-            if filtered_results:
-                ctx.extend(filtered_results)
-                if getattr(search_res, "providers", None):
-                    sources.extend([f"mcp:{p}" for p in search_res.providers])
-                else:
-                    sources.append("mcp:search")
-            else:
-                ctx.append("No supporting info found from search.")
-                sources.append("mcp:search-empty")
-        except Exception as exc:
-            logging.warning("Search inclusion failed: %s", exc)
-            sources.append("mcp:search-error")
-    else:
-        sources.append("search:disabled")
+        sources.append("memory:client_only")
 
-    # Always generate a response - let the LLM decide if it needs external context
+    # No search/tool call logic for TinyLlama (see todo.md)
+    sources.append("search:disabled")
 
+    # Build prompt for completion
     model_name = LLAMA_MODEL_PATH.split('/')[-1].split('\\')[-1].replace('.gguf', '').lower()
-    system_prompt = _resolve_system_prompt(payload.persona_mode, payload.custom_system_prompt)
-    
-    prompt, stop = _build_prompt(model_name, system_prompt, ctx, payload.text)
 
-    reply = _generate_reply(prompt, stop=stop)
-    
-    # Check for tool call
-    import json
-    reply = reply.strip()
-    if reply.endswith("<|im_end|>"):
-        reply = reply[:-len("<|im_end|>")].strip()
-    if reply.startswith("{") and reply.endswith("}"):
-        try:
-            tool_call = json.loads(reply)
-            if "tool" in tool_call and tool_call["tool"] == "search" and "query" in tool_call:
-                # Execute search
-                search_payload = McpSearchRequest(query=tool_call["query"], top_k=3)
-                search_res = mcp_search(search_payload)
-                filtered_results = [
-                    item for item in (search_res.results or [])
-                    if not item.lower().startswith("no direct answer found")
-                    and not item.lower().startswith("stub result")
-                ]
-                if filtered_results:
-                    search_ctx = "\n".join(filtered_results)
-                    sources.extend([f"mcp:{p}" for p in (search_res.providers or [])])
-                else:
-                    search_ctx = "No information found from search."
-                    sources.append("mcp:search-empty")
-                
-                # Generate final response with search results
-                followup_prompt, followup_stop = _build_prompt(model_name, system_prompt, search_ctx, payload.text)
-                reply = _generate_reply(followup_prompt, stop=followup_stop)
-        except json.JSONDecodeError:
-            pass  # Not a tool call, use reply as is
-    
-    audio_base64 = None
-    if getattr(payload, "include_tts", False):
-        logging.info("Generating TTS for reply length: %d", len(reply))
-        try:
-            # Limit TTS text to 500 characters to avoid issues with long responses
-            tts_text = reply[:500]
-            tts_payload = TtsRequest(text=tts_text)
-            tts_res = text_to_speech(tts_payload)
-            audio_base64 = tts_res.audio_base64
-            logging.info("TTS generated successfully")
-        except Exception as exc:
-            logging.warning("TTS call failed: %s", exc)
-            audio_base64 = None
+    if 'qwen' in model_name:
+        from models.qwen import QWEN_SYSTEM_PROMPT
+        messages = [{"role": "system", "content": QWEN_SYSTEM_PROMPT}]
+        messages.extend((payload.context or [])[-4:])
+        messages.append({"role": "user", "content": payload.text})
+        logging.info("[Qwen] Messages: %s", messages)
+        result = _llama.create_chat_completion(messages=messages, max_tokens=256, temperature=0.1)
+        reply = result.get("choices", [{}])[0].get("message", {}).get("content", "")
+        reply = reply.strip() if reply else "(empty response)"
+    else:
+        prompt, stop = _build_prompt(model_name, None, (payload.context or [])[-4:], payload.text)
+        logging.info("[Legacy] Final prompt:\n%s", prompt)
+        logging.info("[Legacy] Stop tokens: %s", stop)
+        from inference.runner import run_tinyllama_inference
+        reply = run_tinyllama_inference(_llama, prompt, stop)
+
+    # Always append user and assistant turns to the context for the response.
+    ctx = append_message(ctx, "user", payload.text)
+    ctx = append_message(ctx, "assistant", reply)
 
     # Store conversation if conversation_id provided
     if payload.conversation_id:
@@ -674,7 +598,39 @@ def process_text(payload: ProcessRequest) -> ProcessResponse:
         except Exception as exc:
             logging.warning("Failed to store conversation: %s", exc)
 
-    return ProcessResponse(reply=reply, context_used=ctx, sources=sources, audio_base64=audio_base64)
+    # Generate TTS if requested
+    audio_base64 = None
+    if payload.include_tts and reply.strip():
+        try:
+            logging.info("Generating TTS for reply (length: %d)", len(reply))
+            tts = SupertonicTTS(auto_download=True)
+            try:
+                style = tts.get_voice_style(voice_name="M1")
+            except:
+                style = tts.get_voice_style()  # fallback to default
+            wav, duration = tts.synthesize(reply, voice_style=style)
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tf:
+                wav_path = tf.name
+            tts.save_audio(wav, wav_path)
+            with open(wav_path, "rb") as f:
+                audio_bytes = f.read()
+            os.remove(wav_path)
+            audio_base64 = base64.b64encode(audio_bytes).decode("utf-8")
+            logging.info("TTS generated for reply, audio size: %d bytes", len(audio_bytes))
+        except Exception as exc:
+            logging.warning("TTS generation failed for reply: %s", exc)
+            audio_base64 = None
+
+    # Convert context to list of strings for API response
+    context_strings = []
+    for msg in ctx:
+        if isinstance(msg, dict):
+            role = msg.get('role', '')
+            content = msg.get('content', '')
+            context_strings.append(f"{role}: {content}")
+        else:
+            context_strings.append(str(msg))
+    return ProcessResponse(reply=reply, context_used=context_strings, sources=sources, audio_base64=audio_base64)
 
 
 

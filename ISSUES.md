@@ -1,3 +1,77 @@
+# 🐞 Bug: Chat Harness & Prompt Handling (TinyLlama, BabbageBox)
+
+## Problem Analysis
+
+### Observed Symptoms
+- Model forgets assigned names after one turn
+- Refuses to answer simple questions (e.g., time)
+- Hallucinates tool instructions (e.g., search JSON)
+- Behaves like a cloud/SaaS AI with guardrails
+- Chat UI responses appear one message late
+
+### Root Causes
+- Incorrect or missing chat templates (TinyLlama requires <|system|>, <|user|>, <|assistant|> formatting)
+- OpenAI-style prompts break behavior
+- System prompt pollution (tool schemas, JSON, SaaS guardrails)
+- Conversation state handling bugs (messages overwritten, not appended)
+- Frontend/backend mismatch in conversation history
+- Monolithic backend design (main.py tightly couples model, prompt, inference logic)
+
+## Key Insight
+Different models require different prompt formats, stop tokens, and system prompts. A single “universal” harness will cause failures. Each model must have its own config and prompt builder.
+
+## Required Fixes
+
+### 1. Model-Specific Configuration
+- Create per-model configs (chat template, stop tokens, allowed system prompt style, context injection rules)
+- Example: TinyLlamaConfig, LlamaInstructConfig, etc.
+- Do NOT reuse OpenAI-style prompts for local models.
+
+### 2. Prompt Handling Fixes
+- Always use correct role tags for TinyLlama: <|system|>, <|user|>, <|assistant|>
+- Strip all tool schemas, JSON, and SaaS guardrails
+- Use minimal system prompt for TinyLlama: “You are a helpful, concise assistant running locally.”
+
+### 3. Conversation State Integrity
+- Ensure every user and assistant turn is appended, never overwritten
+- Frontend must send full conversation history or a conversation_id resolvable by the backend
+- Fix delayed-render bug (response appearing one message late)
+
+### 4. Time & Context Injection
+- If time is needed, inject explicitly via system prompt
+- Do not expect the model to infer runtime context
+
+### 5. Architectural Refactor
+- Break main.py into small, reusable components:
+	- models/ (tinyllama.py, llama_instruct.py, ...)
+	- prompts/ (base.py, tinyllama_prompt.py, ...)
+	- chat/ (history_manager.py, prompt_builder.py, ...)
+	- inference/ (runner.py, ...)
+- Each model must declare its own prompt format, allowed system prompt rules, and stop tokens
+
+### 6. Documentation
+- Update backend-api.md: document TinyLlama chat format, explain why OpenAI-style prompts are forbidden
+- Add inline comments in prompt builder explaining role tag requirements and consequences of prompt pollution
+
+## Success Criteria
+- TinyLlama remembers names across turns
+- No hallucinated tools or SaaS behavior
+- Responses render immediately
+- Prompt logic is reusable for future models
+- Backend architecture is no longer monolithic
+
+---
+
+TinyLlama validated as reference implementation.
+
+---
+
+## Suggested Fix (Summary)
+- Implement model-specific prompt configs and builders
+- Refactor main.py into modular components
+- Fix conversation state append logic
+- Update documentation
+- Verify with TinyLlama chat sanity test (name memory, time, identity)
 # BabbageBox Backend Issues & Bug Tracker
 
 ## Known Issues
@@ -127,3 +201,25 @@
 - Basic logging implemented
 - No metrics collection
 - No health monitoring beyond /api/health
+
+---
+
+## 🔧 Regression Fixes
+
+### Frontend Model Name Display Regression (2025-12-15)
+**Issue:** Frontend failed to update displayed model name when switching models via ModelSelector modal. Chat messages continued showing old model name (e.g., "qwen2.5-1.5b-instruct-q4_k_m") even after switching to new model (e.g., "gemma-2b").
+
+**Root Cause:** `MainChat.vue` only fetched model name on component mount, not when model was changed. ModelSelector emitted `model-set` event but MainChat wasn't listening.
+
+**Fix Applied:**
+- Modified `MainChat.vue` to listen for `model-set` event from ModelSelector
+- Added `onModelSet()` function that calls `fetchModel()` to update `modelName` ref
+- Updated event handler in template: `@model-set="onModelSet"`
+
+**Prevention:**
+- Added unit test in `MainChat.spec.ts` to verify `onModelSet()` calls `fetchModel()`
+- Test ensures regression doesn't reoccur by validating event handling
+
+**Files Changed:**
+- `Babbagebox-Frontend/src/components/MainChat.vue`
+- `Babbagebox-Frontend/src/components/__tests__/MainChat.spec.ts`
