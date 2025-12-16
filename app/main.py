@@ -555,7 +555,7 @@ def process_text(payload: ProcessRequest) -> ProcessResponse:
 
     # Conversation state: always append, never overwrite
     # Use chat.history_manager for append logic
-    from chat.history_manager import append_message
+    from app.chat.history_manager import append_message
     ctx = payload.context or []
     sources: list = []
     
@@ -587,7 +587,10 @@ def process_text(payload: ProcessRequest) -> ProcessResponse:
         reply = run_tinyllama_inference(_llama, prompt, stop)
 
     # Always append user and assistant turns to the context for the response.
-    ctx = append_message(ctx, "user", payload.text)
+    if ctx and ctx[-1]["role"] == "user":
+        ctx[-1]["content"] += "\n" + payload.text
+    else:
+        ctx = append_message(ctx, "user", payload.text)
     ctx = append_message(ctx, "assistant", reply)
 
     # Store conversation if conversation_id provided

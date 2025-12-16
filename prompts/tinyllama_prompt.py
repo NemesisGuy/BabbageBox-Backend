@@ -9,8 +9,8 @@ def build_tinyllama_prompt(system_prompt, history, user_text):
     history_str = ""
     for msg in history:
         if msg['role'] == 'user':
-            history_str += f"<|user|>\n{msg['content']}<|endoftext|>\n"
+            history_str += f"<|user|>\n{msg['content']}\n"
         elif msg['role'] == 'assistant':
-            history_str += f"<|assistant|>\n{msg['content']}<|endoftext|>\n"
+            history_str += f"<|assistant|>\n{msg['content']}\n"
     prompt = TINYLLAMA_PROMPT_TEMPLATE.format(system_prompt=system_prompt, history=history_str, user_text=user_text)
     return prompt, TINYLLAMA_STOP_TOKENS
