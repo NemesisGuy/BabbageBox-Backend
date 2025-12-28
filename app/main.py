@@ -51,6 +51,23 @@ try:
 except ImportError:
     pass  # python-dotenv not installed, use system env vars
 
+# Centralized Chat Logic Imports
+from app.chat.model_configs import (
+    TINYLLAMA_SYSTEM_PROMPT, TINYLLAMA_STOP_TOKENS,
+    GEMMA_SYSTEM_PROMPT, GEMMA_STOP_TOKENS,
+    QWEN_SYSTEM_PROMPT, QWEN_STOP_TOKENS,
+    MISTRAL_SYSTEM_PROMPT, MISTRAL_STOP_TOKENS,
+    PHI2_SYSTEM_PROMPT, PHI2_STOP_TOKENS
+)
+from app.chat.prompt_templates import (
+    build_tinyllama_prompt, 
+    build_gemma_prompt, 
+    build_qwen_prompt, 
+    build_mistral_prompt, 
+    build_phi2_prompt, 
+    get_chat_format
+)
+
 
 class TranscribeRequest(BaseModel):
     audio_base64: Optional[str] = None
@@ -71,6 +88,8 @@ class ProcessRequest(BaseModel):
     custom_system_prompt: Optional[str] = None
     include_search: bool = False
     include_tts: bool = False
+    tts_voice: Optional[str] = None
+    tts_speed: Optional[float] = None
 
 
 
@@ -79,6 +98,7 @@ class ProcessResponse(BaseModel):
     context_used: List[str]
     sources: List[str]
     audio_base64: Optional[str] = None
+    metrics: Optional[dict] = None
 
 
 class PersonasResponse(BaseModel):
@@ -121,6 +141,36 @@ class ConversationItem(BaseModel):
 class ConversationCreateResponse(BaseModel):
     conversation_id: int
     name: Optional[str]
+
+
+# --- Logging Capture ---
+class LogEntry(BaseModel):
+    timestamp: str
+    level: str
+    message: str
+
+
+class LogBufferHandler(logging.Handler):
+    def __init__(self, capacity=100):
+        super().__init__()
+        self.capacity = capacity
+        self.buffer: List[LogEntry] = []
+
+    def emit(self, record):
+        from datetime import datetime
+        entry = LogEntry(
+            timestamp=datetime.fromtimestamp(record.created).strftime("%H:%M:%S"),
+            level=record.levelname,
+            message=self.format(record)
+        )
+        self.buffer.append(entry)
+        if len(self.buffer) > self.capacity:
+            self.buffer.pop(0)
+
+log_handler = LogBufferHandler()
+log_handler.setFormatter(logging.Formatter('%(message)s'))
+logging.getLogger().addHandler(log_handler)
+# -----------------------
 
 
 class McpSearchRequest(BaseModel):
@@ -178,9 +228,8 @@ def list_models():
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_origin_regex=".*",  # match null and any host
-    allow_credentials=False,
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -209,6 +258,9 @@ print(f"Using {LLAMA_N_THREADS} threads for LLM inference (detected {DEFAULT_THR
 
 PERSONA_PRESETS: dict[str, str] = {
     "assistant": "You are a concise, helpful assistant. Keep replies short and clear.",
+    "chat": "You are a helpful AI assistant called BabbageBox. Be friendly and conversational.",
+    "code": "You are an expert software engineer. Focus on clean, efficient, and well-documented code.",
+    "anonymous": "You are a private assistant. Do not reference past conversations.",
     "unhinged": "You are an unpredictable, humorous assistant. Be quirky but still answer the user.",
     "storyteller": "You are a vivid storyteller. Answer by painting a brief narrative.",
     "wise_sage": "You speak like a calm, wise sage with succinct insight.",
@@ -235,6 +287,20 @@ def _normalize_embedding_array(arr: np.ndarray) -> np.ndarray:
         flat = np.pad(flat, (0, EMBED_DIM - flat.size))
     norm = np.linalg.norm(flat)
     return flat / norm if norm > 0 else flat
+
+
+def _clean_text_for_tts(text: str) -> str:
+    """
+    Remove characters that Supertonic TTS might not support or that cause encoding issues.
+    """
+    if not text:
+        return ""
+    # Remove common problematic characters for TTS synthesis
+    # Like metrics blocks: { "tokens_per_second": ... }
+    clean = re.sub(r'\{[^\}]+\}', '', text)  # remove anything in curly braces
+    clean = re.sub(r'\[[^\]]+\]', '', clean)  # remove anything in square brackets
+    clean = re.sub(r'[<>=#*_]', ' ', clean)  # replace markdown/special chars with space
+    return clean.strip()
 
 
 def _normalize_query_for_lookup(q: str) -> str:
@@ -338,18 +404,13 @@ def _init_llama() -> None:
     if model_path and Llama is not None:
         try:
             # Determine chat format based on model name
-            chat_format = None
-            model_name_lower = os.path.basename(model_path).lower()
-            if 'gemma' in model_name_lower:
-                chat_format = "gemma"  # Explicitly set the chat format for Gemma models
-            elif 'tinyllama' in model_name_lower or 'llama' in model_name_lower:
-                chat_format = None  # Manual for TinyLlama/Llama variants
+            chat_format = get_chat_format(model_path)
             
             _llama = Llama(
                 model_path=model_path,
                 n_ctx=LLAMA_CTX_SIZE,
                 n_threads=LLAMA_N_THREADS,
-                chat_format=chat_format,  # Set appropriate chat format
+                chat_format=chat_format,  # Use consolidated chat format logic
             )
             LLAMA_MODEL_PATH = model_path  # Update the global
             logging.info("LLaMA initialized from %s with chat_format=%s", model_path, chat_format)
@@ -519,33 +580,7 @@ def transcribe(payload: TranscribeRequest) -> TranscribeResponse:
         raise HTTPException(status_code=500, detail=f"Transcription failed: {str(exc)}")
 
 
-def _build_prompt(model_name: str, system_prompt: str, ctx: list, user_text: str) -> Tuple[str, List[str]]:
-    """
-    Build a model-specific prompt and return the prompt and stop words.
-    Supports TinyLlama, Gemma, and Qwen models.
-    """
-    if 'tinyllama' in model_name.lower():
-        from prompts.tinyllama_prompt import build_tinyllama_prompt
-        from models.tinyllama import TINYLLAMA_SYSTEM_PROMPT
-        system_prompt = TINYLLAMA_SYSTEM_PROMPT
-        prompt, stop = build_tinyllama_prompt(system_prompt, ctx, user_text)
-    elif 'gemma' in model_name.lower():
-        from prompts.gemma_prompt import build_gemma_prompt
-        from models.gemma import GEMMA_SYSTEM_PROMPT
-        system_prompt = GEMMA_SYSTEM_PROMPT
-        prompt, stop = build_gemma_prompt(system_prompt, ctx, user_text)
-    elif 'qwen' in model_name.lower():
-        from prompts.qwen_prompt import build_qwen_prompt
-        from models.qwen import QWEN_SYSTEM_PROMPT
-        system_prompt = QWEN_SYSTEM_PROMPT
-        prompt, stop = build_qwen_prompt(system_prompt, ctx, user_text)
-    else:
-        # Fallback to TinyLlama for unknown models
-        from prompts.tinyllama_prompt import build_tinyllama_prompt
-        from models.tinyllama import TINYLLAMA_SYSTEM_PROMPT
-        system_prompt = TINYLLAMA_SYSTEM_PROMPT
-        prompt, stop = build_tinyllama_prompt(system_prompt, ctx, user_text)
-    return prompt, stop
+
 
 @app.post("/api/process", response_model=ProcessResponse)
 def process_text(payload: ProcessRequest) -> ProcessResponse:
@@ -564,27 +599,95 @@ def process_text(payload: ProcessRequest) -> ProcessResponse:
     if payload.conversation_id:
         sources.append("memory:client_only")
 
-    # No search/tool call logic for TinyLlama (see todo.md)
-    sources.append("search:disabled")
+    # MCP Search Integration
+    context_used = []
+    if payload.include_search:
+        try:
+            search_res = mcp_search(McpSearchRequest(query=payload.text))
+            if search_res.results:
+                search_text = "\n".join(search_res.results)
+                payload.context = (payload.context or []) + [{"role": "system", "content": f"Search Results:\n{search_text}"}]
+                sources.extend(search_res.providers or ["mcp:search"])
+                context_used.extend(search_res.results)
+            else:
+                sources.append("mcp:search-empty")
+                context_used.append("No supporting info found from search.")
+        except Exception as e:
+            logging.error("Search failed in process_text: %s", e)
+            sources.append("mcp:search-error")
+    else:
+        sources.append("search:disabled")
 
     # Build prompt for completion
     model_name = LLAMA_MODEL_PATH.split('/')[-1].split('\\')[-1].replace('.gguf', '').lower()
 
-    if 'qwen' in model_name:
-        from models.qwen import QWEN_SYSTEM_PROMPT
-        messages = [{"role": "system", "content": QWEN_SYSTEM_PROMPT}]
+    # Try using chat completion if possible
+    try:
+        messages = []
+        system_p = payload.custom_system_prompt or _resolve_system_prompt(payload.persona_mode, None)
+        messages.append({"role": "system", "content": system_p})
         messages.extend((payload.context or [])[-4:])
         messages.append({"role": "user", "content": payload.text})
-        logging.info("[Qwen] Messages: %s", messages)
-        result = _llama.create_chat_completion(messages=messages, max_tokens=256, temperature=0.1)
+        
+        logging.info("[%s] Attempting chat completion with messages: %s", model_name, messages)
+        import time
+        t0 = time.time()
+        # Low temperature for deterministic behavior
+        result = _llama.create_chat_completion(messages=messages, max_tokens=256, temperature=0.7)
+        t1 = time.time()
         reply = result.get("choices", [{}])[0].get("message", {}).get("content", "")
         reply = reply.strip() if reply else "(empty response)"
-    else:
-        prompt, stop = _build_prompt(model_name, None, (payload.context or [])[-4:], payload.text)
-        logging.info("[Legacy] Final prompt:\n%s", prompt)
-        logging.info("[Legacy] Stop tokens: %s", stop)
+        
+        # Extract token usage
+        usage = result.get("usage", {})
+        completion_tokens = usage.get("completion_tokens", 0)
+        gen_time = t1 - t0
+        tps = completion_tokens / gen_time if gen_time > 0 else 0
+        
+        metrics = {
+            "tokens_per_second": round(tps, 2),
+            "generation_time": round(gen_time, 2),
+            "completion_tokens": completion_tokens
+        }
+        
+        logging.info("[%s] Chat completion reply: %s (%.2f tokens/s)", model_name, reply, tps)
+    except Exception as chat_exc:
+        logging.warning("Chat completion failed, falling back to manual prompt building: %s", chat_exc)
+        import time
+        t0 = time.time()
+        # Fallback to manual prompt building
+        if 'tinyllama' in model_name:
+            prompt, stop = build_tinyllama_prompt(None, (payload.context or [])[-4:], payload.text)
+        elif 'gemma' in model_name:
+            prompt, stop = build_gemma_prompt(None, (payload.context or [])[-4:], payload.text)
+        elif 'qwen' in model_name:
+            prompt, stop = build_qwen_prompt(None, (payload.context or [])[-4:], payload.text)
+        elif 'mistral' in model_name:
+            prompt, stop = build_mistral_prompt(None, (payload.context or [])[-4:], payload.text)
+        elif 'phi' in model_name:
+            prompt, stop = build_phi2_prompt(None, (payload.context or [])[-4:], payload.text)
+        else:
+            # Default to TinyLlama format if unknown
+            prompt, stop = build_tinyllama_prompt(None, (payload.context or [])[-4:], payload.text)
+            
+        logging.info("[Fallback] Final prompt:\n%s", prompt)
+        logging.info("[Fallback] Stop tokens: %s", stop)
+        
         from inference.runner import run_tinyllama_inference
         reply = run_tinyllama_inference(_llama, prompt, stop)
+        t1 = time.time()
+        
+        # Estimate tokens for fallback (approx 4 chars per token)
+        completion_tokens = len(reply) // 4
+        gen_time = t1 - t0
+        tps = completion_tokens / gen_time if gen_time > 0 else 0
+        
+        metrics = {
+            "tokens_per_second": round(tps, 2),
+            "generation_time": round(gen_time, 2),
+            "completion_tokens": completion_tokens,
+            "is_fallback": True
+        }
 
     # Always append user and assistant turns to the context for the response.
     if ctx and ctx[-1]["role"] == "user":
@@ -608,10 +711,13 @@ def process_text(payload: ProcessRequest) -> ProcessResponse:
             logging.info("Generating TTS for reply (length: %d)", len(reply))
             tts = SupertonicTTS(auto_download=True)
             try:
-                style = tts.get_voice_style(voice_name="M1")
+                style = tts.get_voice_style(voice_name=payload.tts_voice or "M1")
             except:
                 style = tts.get_voice_style()  # fallback to default
-            wav, duration = tts.synthesize(reply, voice_style=style)
+            clean_reply = _clean_text_for_tts(reply)
+            wav, duration = tts.synthesize(clean_reply, voice_style=style)
+            # Apply speed if we have a way (synthesize might not support it directly, 
+            # but we can simulate it in the player as we do in the playground)
             with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tf:
                 wav_path = tf.name
             tts.save_audio(wav, wav_path)
@@ -633,7 +739,13 @@ def process_text(payload: ProcessRequest) -> ProcessResponse:
             context_strings.append(f"{role}: {content}")
         else:
             context_strings.append(str(msg))
-    return ProcessResponse(reply=reply, context_used=context_strings, sources=sources, audio_base64=audio_base64)
+    return ProcessResponse(
+        reply=reply, 
+        context_used=context_used, 
+        sources=sources, 
+        audio_base64=audio_base64,
+        metrics=metrics
+    )
 
 
 
@@ -710,7 +822,11 @@ async def supertonic_command(request: Request):
 # Runtime config endpoint for model path
 @app.get("/api/config")
 async def get_config():
-    return {"llama_model_path": LLAMA_MODEL_PATH}
+    import os
+    return {
+        "llama_model_path": LLAMA_MODEL_PATH,
+        "current_model": os.path.basename(LLAMA_MODEL_PATH) if LLAMA_MODEL_PATH else "Unknown"
+    }
 
 
 @app.post("/api/config")
@@ -916,3 +1032,8 @@ def context_correct(payload: ContextCorrectionRequest) -> ContextCorrectionRespo
 @app.get("/api/personas", response_model=PersonasResponse)
 def list_personas() -> PersonasResponse:
     return PersonasResponse(personas=PERSONA_PRESETS)
+
+
+@app.get("/api/logs", response_model=List[LogEntry])
+def get_logs():
+    return log_handler.buffer

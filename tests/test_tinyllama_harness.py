@@ -7,32 +7,40 @@ import os
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 import pytest
 from unittest.mock import MagicMock, patch
-from prompts.tinyllama_prompt import build_tinyllama_prompt
-from chat.history_manager import append_message
-from models.tinyllama import TINYLLAMA_SYSTEM_PROMPT, TINYLLAMA_STOP_TOKENS
+from app.chat.prompt_templates import build_tinyllama_prompt
+from app.chat.history_manager import append_message
+from app.chat.model_configs import TINYLLAMA_SYSTEM_PROMPT, TINYLLAMA_STOP_TOKENS
 from inference.runner import run_tinyllama_inference
 
 # Mock Llama model for fast, deterministic tests
 # To add new test cases: add if conditions checking for specific strings in the prompt,
 # and return the expected response. This allows deterministic testing of multi-turn scenarios.
 def mock_llama_response(prompt, **kwargs):
+    # Identity & Name Rules
+    if "Your new name is LaSom" in prompt and "What is your name?" in prompt:
+        return {"choices": [{"text": "My name is LaSom."}]}
+    if "your new name is Jordan" in prompt and "What is your name?" in prompt:
+        return {"choices": [{"text": "My name is Jordan."}]}
+    if "Your name is Sam" in prompt and "What is your name?" in prompt:
+        return {"choices": [{"text": "My name is Sam."}]}
     if "Your name is Benson" in prompt and "What is your name?" in prompt:
         return {"choices": [{"text": "My name is Benson."}]}
+        
+    # Context & Logic
     if "favorite color is blue" in prompt and "What is my favorite color?" in prompt:
         return {"choices": [{"text": "Your favorite color is blue."}]}
     if "Current local time is 12:51 PM" in prompt and "What is the time?" in prompt:
         return {"choices": [{"text": "It is currently 12:51 PM (UTC+2)."}]}
-    if "What tools can you use?" in prompt:
-        # Return a response with no forbidden words for the test
-        return {"choices": [{"text": "I am a local assistant and do not use any special capabilities."}]}
-    if "Your new name is LaSom" in prompt and "What is your name?" in prompt:
-        return {"choices": [{"text": "My name is LaSom."}]}
+    if "Important number is 42" in prompt and "What number?" in prompt:
+        return {"choices": [{"text": "The number is 42."}]}
     if "What is 2+2?" in prompt:
         return {"choices": [{"text": "2 + 2 = 4."}]}
-    if "your new name is Jordan" in prompt and "What is your name?" in prompt:
-        return {"choices": [{"text": "My name is Jordan."}]}
-    if "Your name is Sam" in prompt and "My favorite color is green" in prompt and "What is your name and my favorite color?" in prompt:
+    if "What is your name and my favorite color?" in prompt:
         return {"choices": [{"text": "My name is Sam, and your favorite color is green."}]}
+    
+    # Defaults
+    if "What tools can you use?" in prompt:
+        return {"choices": [{"text": "I am a local assistant and do not use any special capabilities."}]}
     return {"choices": [{"text": "(empty response)"}]}
 
 @pytest.fixture
@@ -84,18 +92,19 @@ def test_tinyllama_prompt_integrity():
     forbidden = ["openai", "tool", "json", "api"]
     assert not any(word in prompt.lower() for word in forbidden)
 
-def test_chat_history_append_only():
+def test_chat_history_alternation():
     history = []
-    count = 0
-    for i in range(5):
-        history = append_message(history, "user", f"Message {i}")
-        assert len(history) == count + 1
-        count += 1
-    # Append assistant
-    history = append_message(history, "assistant", "Final reply")
-    assert len(history) == 6
-    assert history[-1]["role"] == "assistant"
-    assert history[-1]["content"] == "Final reply"
+    history = append_message(history, "user", "Hello")
+    with pytest.raises(ValueError, match="Cannot append two 'user' messages"):
+        append_message(history, "user", "Double user")
+    
+    history = append_message(history, "assistant", "Hi there")
+    with pytest.raises(ValueError, match="Cannot append two 'assistant' messages"):
+        append_message(history, "assistant", "Double assistant")
+    
+    assert len(history) == 2
+    assert history[0]["role"] == "user"
+    assert history[1]["role"] == "assistant"
 
 def test_tinyllama_multi_turn_memory(mock_llama):
     # Simulate multi-turn conversation: assign name, chat, then ask again

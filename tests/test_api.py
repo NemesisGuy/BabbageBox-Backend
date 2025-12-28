@@ -16,10 +16,28 @@ def test_personas_endpoint():
     assert "assistant" in data["personas"]
 
 
+
+def get_mock_llama(captured=None):
+    class MockLlama:
+        def __call__(self, prompt, **kwargs):
+            return {"choices": [{"text": "ok-via-call"}]}
+        def create_chat_completion(self, messages, **kwargs):
+            if captured is not None:
+                captured.clear()
+                captured.extend(messages)
+            return {
+                "choices": [{"message": {"content": "ok"}}],
+                "usage": {"completion_tokens": 10}
+            }
+        def create_completion(self, prompt, **kwargs):
+            return {"choices": [{"text": "ok-via-completion"}]}
+    return MockLlama()
+
 def test_process_includes_search_context(monkeypatch):
-    # Stub search and generation to avoid network/model calls.
-    monkeypatch.setattr(main, "mcp_search", lambda req: main.McpSearchResult(results=["result-one", "result-two"]))
-    monkeypatch.setattr(main, "_generate_reply", lambda prompt, stop=None, max_tokens=256: "ok")
+    captured = []
+    monkeypatch.setattr(main, "_llama", get_mock_llama(captured))
+    monkeypatch.setattr(main, "mcp_search", lambda req: main.McpSearchResult(results=["result-one", "result-two"], providers=["mcp:search"]))
+    monkeypatch.setattr(main, "_generate_reply", lambda prompt, **kwargs: "ok")
 
     res = client.post(
         "/api/process",
@@ -40,7 +58,8 @@ def test_process_includes_search_context(monkeypatch):
 
 
 def test_process_without_search(monkeypatch):
-    monkeypatch.setattr(main, "_generate_reply", lambda prompt, stop=None, max_tokens=256: "ok-no-search")
+    monkeypatch.setattr(main, "_llama", get_mock_llama())
+    monkeypatch.setattr(main, "_generate_reply", lambda prompt, **kwargs: "ok-no-search")
     res = client.post(
         "/api/process",
         json={"text": "plain", "include_search": False},
@@ -52,6 +71,7 @@ def test_process_without_search(monkeypatch):
 
 
 def test_process_generates_even_when_search_empty(monkeypatch):
+    monkeypatch.setattr(main, "_llama", get_mock_llama())
     # Simulate search returning only placeholder text; with no other context, it should answer 'I don't know'.
     monkeypatch.setattr(
         main,
@@ -109,46 +129,51 @@ def test_process_marks_search_error(monkeypatch):
     def explode(req):
         raise RuntimeError("boom")
 
+    monkeypatch.setattr(main, "_llama", get_mock_llama())
     monkeypatch.setattr(main, "mcp_search", explode)
-    monkeypatch.setattr(main, "_generate_reply", lambda prompt, stop=None, max_tokens=256: "ok-after-error")
 
     res = client.post(
         "/api/process",
-        json={"text": "test", "include_search": True, "context": ["manual"]},
+        json={"text": "test", "include_search": True, "context": [{"role": "user", "content": "manual"}]},
     )
 
     assert res.status_code == 200
     data = res.json()
     assert "mcp:search-error" in data["sources"]
-    assert data["reply"] == "ok-after-error"
+    assert data["reply"] == "ok"
 
 
 def test_prompt_includes_guardrails(monkeypatch):
-    captured_prompt = {}
-
-    def capture_prompt(prompt: str, stop: List[str] = None, max_tokens: int = 256) -> str:
-        captured_prompt["prompt"] = prompt
-        return "ok"
-
-    monkeypatch.setattr(main, "_generate_reply", capture_prompt)
+    captured = []
+    monkeypatch.setattr(main, "_llama", get_mock_llama(captured))
+    monkeypatch.setattr(main, "_generate_reply", lambda prompt, **kwargs: "ok")
 
     res = client.post(
         "/api/process",
         json={
             "text": "who are you?",
             "include_search": False,
-            "context": ["memory1"],
+            "context": [{"role": "user", "content": "memory1"}],
             "persona_mode": "storyteller",
         },
     )
 
     assert res.status_code == 200
     assert res.json()["reply"] == "ok"
-    prompt = captured_prompt.get("prompt")
-    assert prompt is not None
-    assert "You are a vivid storyteller." in prompt
-    assert "Context:\nmemory1" in prompt
-    assert "who are you?" in prompt
+    
+    # Check roles strictly
+    roles = [m.get("role") for m in captured]
+    assert "system" in roles, f"System message missing in {roles}"
+    assert "user" in roles, f"User message missing in {roles}"
+    
+    # Verify content
+    messages = captured
+    system_msg = next(m for m in messages if m["role"] == "system")
+    assert "storyteller" in system_msg["content"] or "vivid storyteller" in system_msg["content"].lower()
+    
+    user_msgs = [m for m in messages if m["role"] == "user"]
+    assert any("memory1" in m["content"] for m in user_msgs)
+    assert user_msgs[-1]["content"] == "who are you?"
 
 
 def test_faiss_dimension_mismatch_rebuilds(monkeypatch):
@@ -270,3 +295,14 @@ def test_rebuild_index_handles_mixed_embedding_shapes(monkeypatch):
     assert main._faiss_index is not None
     assert getattr(main._faiss_index, "d") == main.EMBED_DIM
     assert len(main._mem_meta) == 2
+
+
+def test_logs_endpoint():
+    res = client.get("/api/logs")
+    assert res.status_code == 200
+    data = res.json()
+    assert isinstance(data, list)
+    # Check if we have at least our startup logs or the test logs
+    if len(data) > 0:
+        assert "level" in data[0]
+        assert "message" in data[0]

@@ -1,7 +1,6 @@
 # BabbageBox Backend .gitignore
-models/
-checkpoints/
-weights/
+/checkpoints/
+/weights/
 venv/
 .venv/
 ENV/
@@ -21,8 +20,8 @@ __pycache__/
 .DS_Store
 Thumbs.db
 .pytest_cache/
-data/
-data/*
+/data/
+/data/*
 !data/.gitkeep
 .env
 .env.*

@@ -7,9 +7,9 @@ import os
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 import pytest
 from unittest.mock import MagicMock
-from prompts.gemma_prompt import build_gemma_prompt
-from chat.history_manager import append_message
-from models.gemma import GEMMA_SYSTEM_PROMPT, GEMMA_STOP_TOKENS
+from app.chat.prompt_templates import build_gemma_prompt
+from app.chat.history_manager import append_message
+from app.chat.model_configs import GEMMA_SYSTEM_PROMPT, GEMMA_STOP_TOKENS
 from inference.runner import run_tinyllama_inference  # Reuse for Gemma since interface is same
 
 # Mock Llama model for fast, deterministic tests
