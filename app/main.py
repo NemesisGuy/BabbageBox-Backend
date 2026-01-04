@@ -450,10 +450,25 @@ def _init_llama() -> None:
             LLAMA_MODEL_PATH = model_path  # Update the global
             logging.info("LLaMA initialized from %s with chat_format=%s", model_path, chat_format)
         except Exception as exc:  # pragma: no cover - runtime guard
-            logging.warning("LLaMA init failed, using stubs. Error: %s", exc)
+            logging.exception("LLaMA init failed; will return 503 until resolved. Error: %s", exc)
             _llama = None
     else:
         logging.info("No model path available or llama_cpp missing; using stub responses.")
+
+
+def _ensure_llama_initialized() -> Optional[str]:
+    """Ensure the model is loaded; return error string if not."""
+    if _llama is not None:
+        return None
+    # Try once more in case of lazy-load mode
+    try:
+        _init_llama()
+    except Exception as exc:  # pragma: no cover - runtime guard
+        logging.exception("LLaMA re-init attempt failed: %s", exc)
+        return f"model_init_failed: {exc}"
+    if _llama is None:
+        return "model_uninitialized"
+    return None
 
 
 def _init_whisper() -> None:
@@ -624,8 +639,9 @@ def process_text(payload: ProcessRequest) -> ProcessResponse:
     logging.info("[DEBUG] Received context (len=%d): %s", len(payload.context or []), json.dumps(payload.context or [], ensure_ascii=False, indent=2))
 
     # If the model backend is not available, return a controlled 503 response
-    if _llama is None:
-        logging.error("LLaMA model not initialized; rejecting request with 503 Service Unavailable")
+    llama_err = _ensure_llama_initialized()
+    if llama_err is not None:
+        logging.error("LLaMA model not initialized; rejecting request with 503 Service Unavailable (%s)", llama_err)
         return JSONResponse(
             status_code=503,
             content={
@@ -633,7 +649,7 @@ def process_text(payload: ProcessRequest) -> ProcessResponse:
                 "context_used": [],
                 "sources": ["model:unavailable"],
                 "audio_base64": None,
-                "metrics": {"is_fallback": True, "error": "model_uninitialized"}
+                "metrics": {"is_fallback": True, "error": llama_err}
             },
         )
 
