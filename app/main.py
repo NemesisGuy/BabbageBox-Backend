@@ -4,9 +4,9 @@
 # Allow runtime override
 def set_llama_model_path(path: str):
     global LLAMA_MODEL_PATH
-    # If only a filename is provided, prepend models directory
+    # Use MODELS_DIR env or default to /models
+    models_dir = Path(os.environ.get("MODELS_DIR", "/models"))
     if not os.path.isabs(path):
-        models_dir = Path(r"C:/Users/Reign/Documents/Python Projects/BabbageBox/models")
         full_path = str(models_dir / path)
     else:
         full_path = path
@@ -195,18 +195,41 @@ class ContextCorrectionResponse(BaseModel):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print("Starting lifespan")
+    import sys
+    print("Starting lifespan", flush=True)
+    sys.stdout.flush()
+    sys.stderr.flush()
     try:
+        print("[Lifespan] Initializing database...", flush=True)
         _init_db()
-        print("DB init done")
-        _init_llama()
-        print("Llama init done")
-        # _init_whisper()
-        print("Yielding")
+        print("[Lifespan] DB init done", flush=True)
+        sys.stdout.flush()
+        
+        # Check if we should load model at startup or lazily
+        lazy_load = os.environ.get("LAZY_MODEL_LOAD", "true").lower() == "true"
+        
+        if lazy_load:
+            print("[Lifespan] LAZY_MODEL_LOAD=true - Model will load on first request", flush=True)
+            print(f"[Lifespan] Model path (deferred): {LLAMA_MODEL_PATH}", flush=True)
+        else:
+            print("[Lifespan] Initializing LLaMA model at startup...", flush=True)
+            print(f"[Lifespan] Model path: {LLAMA_MODEL_PATH}", flush=True)
+            print(f"[Lifespan] Llama available: {Llama is not None}", flush=True)
+            sys.stdout.flush()
+            _init_llama()
+            print("[Lifespan] LLaMA init done", flush=True)
+        
+        sys.stdout.flush()
+        print("[Lifespan] Startup complete, yielding...", flush=True)
+        sys.stdout.flush()
         yield
-        print("Lifespan end")
+        print("[Lifespan] Shutdown", flush=True)
     except Exception as e:
-        print(f"Exception in lifespan: {e}")
+        import traceback
+        print(f"[Lifespan] EXCEPTION: {e}", flush=True)
+        traceback.print_exc()
+        sys.stdout.flush()
+        sys.stderr.flush()
         raise
 
 
@@ -217,7 +240,7 @@ app = FastAPI(title="BabbageBox Backend", description="CPU-only local assistant 
 @app.get("/api/models")
 def list_models():
     import os
-    models_dir = Path(r"C:/Users/Reign/Documents/Python Projects/BabbageBox/models")
+    models_dir = Path(os.environ.get("MODELS_DIR", "/models"))
     print(f"DEBUG: CWD: {os.getcwd()}")
     print(f"DEBUG: Searching for models in {models_dir}")
     all_files = list(models_dir.iterdir()) if models_dir.exists() else []
@@ -239,7 +262,17 @@ app.add_middleware(
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 DB_PATH = DATA_DIR / "babbage.db"
 EMBED_DIM = 384
-LLAMA_MODEL_PATH = r"C:/Users/Reign/Documents/Python Projects/BabbageBox/models/qwen2.5-1.5b-instruct-q4_k_m.gguf"
+MODELS_DIR = os.environ.get("MODELS_DIR", "/models")
+model_files = list(Path(MODELS_DIR).glob("*.gguf"))
+if model_files:
+    LLAMA_MODEL_PATH = os.environ.get("LLAMA_MODEL_PATH", str(model_files[0]))
+else:
+    LLAMA_MODEL_PATH = os.environ.get("LLAMA_MODEL_PATH", "")
+if LLAMA_MODEL_PATH and not Path(LLAMA_MODEL_PATH).exists():
+    logging.warning("Model file %s does not exist, using stubs", LLAMA_MODEL_PATH)
+    LLAMA_MODEL_PATH = ""
+print(f"[BabbageBox] Using MODELS_DIR={MODELS_DIR}")
+print(f"[BabbageBox] Using LLAMA_MODEL_PATH={LLAMA_MODEL_PATH}")
 WHISPER_MODEL_SIZE = os.environ.get("WHISPER_MODEL_SIZE", "tiny")
 
 # ------------------------------------------------------------
@@ -590,6 +623,20 @@ def process_text(payload: ProcessRequest) -> ProcessResponse:
     # Debug: log the received context for troubleshooting memory issues
     logging.info("[DEBUG] Received context (len=%d): %s", len(payload.context or []), json.dumps(payload.context or [], ensure_ascii=False, indent=2))
 
+    # If the model backend is not available, return a controlled 503 response
+    if _llama is None:
+        logging.error("LLaMA model not initialized; rejecting request with 503 Service Unavailable")
+        return JSONResponse(
+            status_code=503,
+            content={
+                "reply": "(model not available)",
+                "context_used": [],
+                "sources": ["model:unavailable"],
+                "audio_base64": None,
+                "metrics": {"is_fallback": True, "error": "model_uninitialized"}
+            },
+        )
+
     # Conversation state: always append, never overwrite
     # Use chat.history_manager for append logic
     from app.chat.history_manager import append_message
@@ -635,6 +682,9 @@ def process_text(payload: ProcessRequest) -> ProcessResponse:
         import time
         t0 = time.time()
         # Low temperature for deterministic behavior
+        if _llama is None:
+            # Force a controlled exception to trigger fallback path
+            raise RuntimeError("LLaMA model not initialized; falling back to manual prompt")
         result = _llama.create_chat_completion(messages=messages, max_tokens=256, temperature=0.7)
         t1 = time.time()
         reply = result.get("choices", [{}])[0].get("message", {}).get("content", "")
